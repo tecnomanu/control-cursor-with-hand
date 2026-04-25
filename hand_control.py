@@ -1,18 +1,20 @@
 """
-Hand Control para macOS
------------------------
-Controlar el cursor del Mac con gestos de la mano usando la cámara web.
+Hand Control for macOS
+----------------------
+Control the Mac cursor with hand gestures using the webcam.
 
-Gestos:
-  - Mover índice + pulgar  -> mueve el cursor (punto medio entre ambos)
-  - Pellizco índice+pulgar -> click (corto) / drag (sostenido)
-  - Doble pellizco rápido  -> doble click
-  - Pellizco anular+pulgar -> click derecho
+Gestures:
+  - Move index + thumb      -> move cursor (midpoint between both tips)
+  - Pinch index + thumb     -> left click (short) / drag (hold)
+  - Double pinch quickly    -> double click
+  - Pinch middle + thumb    -> middle click (scroll)
+  - Pinch ring + thumb      -> right click (hold)
+  - Tap pinky + thumb       -> instant right click
 
-Atajos (click en la miniatura de debug para activar):
-  ESC / Cmd+Q -> salir
-  D           -> mostrar / ocultar miniatura de debug
-  M           -> activar / desactivar control del mouse
+Shortcuts (click the debug preview to focus it first):
+  ESC / Cmd+Q -> quit
+  D           -> show / hide debug preview
+  M           -> enable / disable mouse control
 """
 
 import math
@@ -29,13 +31,13 @@ from PyQt5.QtCore import Qt, QPoint, QTimer
 from PyQt5.QtGui import QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap, QRadialGradient
 from PyQt5.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
 
-# ----- Configuración general -----
-PINCH_ON_THRESHOLD   = 0.055  # distancia normalizada para activar el pellizco
-PINCH_OFF_THRESHOLD  = 0.085  # histeresis: distancia para soltar (evita parpadeo)
-SMOOTHING            = 0.15   # 0 = sin suavizado, 1 = sin movimiento
-DEADZONE_PX          = 5      # movimientos < N px pantalla se ignoran (anti-jitter)
-EDGE_MARGIN          = 0.12   # recorte de bordes de la cámara
-DOUBLE_CLICK_INTERVAL = 0.35  # segundos entre pellizcos para doble click
+# ----- General settings -----
+PINCH_ON_THRESHOLD    = 0.055  # normalized distance to trigger a pinch
+PINCH_OFF_THRESHOLD   = 0.085  # hysteresis: distance to release (prevents flickering)
+SMOOTHING             = 0.15   # 0 = no smoothing, 1 = no movement
+DEADZONE_PX           = 5      # movements smaller than N screen px are ignored (anti-jitter)
+EDGE_MARGIN           = 0.12   # camera edge crop to make corners reachable
+DOUBLE_CLICK_INTERVAL = 0.35   # max seconds between two pinches to count as double click
 CAMERA_INDEX = 0
 CAMERA_WIDTH = 960
 CAMERA_HEIGHT = 540
@@ -46,9 +48,9 @@ pyautogui.PAUSE = 0
 SCREEN_W, SCREEN_H = pyautogui.size()
 
 
-# ----- Helpers macOS (sin deps extra, usa ctypes sobre Obj-C runtime) -----
+# ----- macOS helpers (no extra deps — ctypes over the Obj-C runtime) -----
 def _macos_background_app():
-    """Sin ícono en el Dock; evita que las ventanas se oculten al cambiar de app."""
+    """Remove Dock icon; prevents windows from hiding when switching apps."""
     try:
         import ctypes, ctypes.util
         _objc = ctypes.CDLL(ctypes.util.find_library('objc'))
@@ -68,7 +70,7 @@ def _macos_background_app():
 
 
 def _macos_float_window(widget, ignore_mouse=False):
-    """Flota sobre todas las apps, nunca se oculta al perder foco."""
+    """Float above all apps and never hide when losing focus."""
     try:
         import ctypes, ctypes.util
         _objc = ctypes.CDLL(ctypes.util.find_library('objc'))
@@ -89,8 +91,8 @@ def _macos_float_window(widget, ignore_mouse=False):
             _objc.objc_msgSend(ns_win, _objc.sel_registerName(sel), val)
 
         _send_long(b'setLevel:', 3)                  # NSFloatingWindowLevel
-        _send_bool(b'setHidesOnDeactivate:', False)  # nunca se oculta al cambiar app
-        # NSWindowCollectionBehaviorCanJoinAllSpaces|Stationary|IgnoresCycle
+        _send_bool(b'setHidesOnDeactivate:', False)  # stay visible when app loses focus
+        # NSWindowCollectionBehaviorCanJoinAllSpaces | Stationary | IgnoresCycle
         _objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
         _objc.objc_msgSend(ns_win, _objc.sel_registerName(b'setCollectionBehavior:'),
                            ctypes.c_uint64(1 | 16 | 64))
@@ -101,7 +103,7 @@ def _macos_float_window(widget, ignore_mouse=False):
 
 
 def _macos_order_front(widget):
-    """Trae la ventana al frente SIN activar la app ni robar foco del teclado."""
+    """Bring window to front WITHOUT activating the app or stealing keyboard focus."""
     try:
         import ctypes, ctypes.util
         _objc = ctypes.CDLL(ctypes.util.find_library('objc'))
@@ -116,9 +118,9 @@ def _macos_order_front(widget):
         pass
 
 
-# ----- Eventos de mouse vía Quartz (pyautogui usa kCGEventMouseMoved siempre,
-#        lo que rompe el drag/selección de texto; necesitamos kCGEventLeftMouseDragged
-#        cuando el botón está apretado) -----
+# ----- Mouse events via Quartz
+# pyautogui always sends kCGEventMouseMoved, which breaks drag and text selection.
+# We need kCGEventLeftMouseDragged when a button is held down.
 import Quartz as _Q
 
 def _mouse_move(x, y, dragging=False):
@@ -153,7 +155,7 @@ def _mouse_middle_up(x, y):
     _Q.CGEventPost(_Q.kCGHIDEventTap, ev)
 
 
-# Estado compartido entre el hilo de tracking y la UI de Qt.
+# ----- Shared state between the tracking thread and the Qt UI -----
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -188,9 +190,9 @@ class SharedState:
 state = SharedState()
 
 
-# ----- Cursor con efecto glow (overlay click-through) -----
+# ----- Glow cursor overlay (click-through) -----
 class GlowCursor(QWidget):
-    SIZE = 90  # px del overlay
+    SIZE = 90  # overlay size in px
 
     def __init__(self):
         super().__init__()
@@ -227,39 +229,38 @@ class GlowCursor(QWidget):
     def paintEvent(self, _event):
         _, _, pinching, _, mouse_on = state.snapshot()
         with state.lock:
-            right = state.is_right_clicking
+            right  = state.is_right_clicking
+            middle = state.is_middle_clicking
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         center = QPoint(self.SIZE // 2, self.SIZE // 2)
 
-        with state.lock:
-            middle = state.is_middle_clicking
         if not mouse_on:
-            color = QColor(180, 180, 180)   # gris: pausado
+            color = QColor(180, 180, 180)  # gray: paused
         elif right:
-            color = QColor(180, 80, 255)    # violeta: click derecho
+            color = QColor(180, 80, 255)   # purple: right click
         elif middle:
-            color = QColor(80, 220, 160)    # verde: click medio
+            color = QColor(80, 220, 160)   # green: middle click
         elif pinching:
-            color = QColor(255, 80, 80)     # rojo: click izquierdo / drag
+            color = QColor(255, 80, 80)    # red: left click / drag
         else:
-            color = QColor(80, 180, 255)    # azul: idle
+            color = QColor(80, 180, 255)   # blue: idle
 
-        # Halo (glow) con gradiente radial
+        # Radial gradient glow
         gradient = QRadialGradient(center, self.SIZE / 2)
-        gradient.setColorAt(0.0, QColor(color.red(), color.green(), color.blue(), 200))
+        gradient.setColorAt(0.0,  QColor(color.red(), color.green(), color.blue(), 200))
         gradient.setColorAt(0.35, QColor(color.red(), color.green(), color.blue(), 110))
-        gradient.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0))
+        gradient.setColorAt(1.0,  QColor(color.red(), color.green(), color.blue(), 0))
         painter.setBrush(QBrush(gradient))
         painter.setPen(Qt.NoPen)
         painter.drawEllipse(0, 0, self.SIZE, self.SIZE)
 
-        # Punto central blanco
+        # White center dot
         painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
         painter.drawEllipse(self.SIZE // 2 - 6, self.SIZE // 2 - 6, 12, 12)
 
 
-# ----- Miniatura de debug en la esquina (hilo principal de Qt) -----
+# ----- Debug preview thumbnail (bottom-left corner, Qt main thread) -----
 class DebugOverlay(QWidget):
     PREVIEW_W = 320
     PREVIEW_H = 180
@@ -288,7 +289,7 @@ class DebugOverlay(QWidget):
         layout.addWidget(self._label)
         self.adjustSize()
 
-        # Posiciona en esquina inferior-izquierda
+        # Position in the bottom-left corner
         self.move(
             self.MARGIN,
             SCREEN_H - self.PREVIEW_H - self.MARGIN * 3,
@@ -296,7 +297,7 @@ class DebugOverlay(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(33)  # ~30 fps es suficiente para preview
+        self._timer.start(33)  # ~30 fps is enough for a preview
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -316,7 +317,7 @@ class DebugOverlay(QWidget):
             return
 
         h, w = frame.shape[:2]
-        rgb = frame[:, :, ::-1].copy()  # BGR → RGB
+        rgb = frame[:, :, ::-1].copy()  # BGR -> RGB
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
         self._label.setPixmap(
             QPixmap.fromImage(qimg).scaled(
@@ -338,13 +339,12 @@ class DebugOverlay(QWidget):
             state.update(mouse_control_enabled=not mouse_on)
 
 
-# ----- Hilo de detección de mano -----
-# ----- Ícono en la barra de menú -----
+# ----- Menu bar icon -----
 class TrayIcon(QSystemTrayIcon):
     def __init__(self, tracker, parent=None):
         super().__init__(self._make_icon(), parent)
         self._tracker = tracker
-        self.setToolTip("Hand Control activo")
+        self.setToolTip("Hand Control running")
 
         menu = QMenu()
         self._act_mouse = menu.addAction("Mouse: ON")
@@ -352,7 +352,7 @@ class TrayIcon(QSystemTrayIcon):
         self._act_debug = menu.addAction("Debug: ON")
         self._act_debug.triggered.connect(self._toggle_debug)
         menu.addSeparator()
-        menu.addAction("Salir").triggered.connect(self._quit)
+        menu.addAction("Quit").triggered.connect(self._quit)
         self.setContextMenu(menu)
         self.show()
 
@@ -390,7 +390,7 @@ class TrayIcon(QSystemTrayIcon):
         self.setIcon(self._make_icon(mouse_on))
 
 
-# ----- Hilo de detección de mano -----
+# ----- Hand tracking thread -----
 class HandTracker(threading.Thread):
     def __init__(self, debug=True):
         super().__init__(daemon=True)
@@ -398,12 +398,12 @@ class HandTracker(threading.Thread):
         self.running = True
         self._smooth_x = SCREEN_W / 2
         self._smooth_y = SCREEN_H / 2
-        self._was_pinching       = False
-        self._was_right_clicking = False
+        self._was_pinching        = False
+        self._was_right_clicking  = False
         self._was_middle_clicking = False
-        self._was_pinky_near     = False
-        self._last_pinch_end     = 0.0
-        self._click_count        = 1
+        self._was_pinky_near      = False
+        self._last_pinch_end      = 0.0
+        self._click_count         = 1
 
     def stop(self):
         self.running = False
@@ -417,12 +417,12 @@ class HandTracker(threading.Thread):
         MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "hand_landmarker.task")
         if not os.path.exists(MODEL_PATH):
-            print("Descargando modelo de deteccion de mano (~8 MB)...")
+            print("Downloading hand landmark model (~8 MB)...")
             url = ("https://storage.googleapis.com/mediapipe-models/"
                    "hand_landmarker/hand_landmarker/float16/latest/"
                    "hand_landmarker.task")
             urllib.request.urlretrieve(url, MODEL_PATH)
-            print("Modelo listo.")
+            print("Model ready.")
 
         base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
         options = mp_vision.HandLandmarkerOptions(
@@ -444,8 +444,8 @@ class HandTracker(threading.Thread):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
 
         if not cap.isOpened():
-            print("ERROR: no se pudo abrir la camara. Revisa permisos en"
-                  " Ajustes del Sistema -> Privacidad y seguridad -> Camara.")
+            print("ERROR: could not open camera. Check permissions at "
+                  "System Settings -> Privacy & Security -> Camera.")
             QApplication.quit()
             return
 
@@ -458,7 +458,7 @@ class HandTracker(threading.Thread):
             if not ok:
                 continue
 
-            frame = cv2.flip(frame, 1)  # espejo: mover a la derecha mueve a la derecha
+            frame = cv2.flip(frame, 1)  # mirror so moving right moves right
             h, w, _ = frame.shape
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -466,11 +466,11 @@ class HandTracker(threading.Thread):
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             results = landmarker.detect_for_video(mp_image, ts_ms)
 
-            hand_visible      = False
-            is_pinching_now   = self._was_pinching
-            is_right_now      = self._was_right_clicking
-            is_middle_now     = self._was_middle_clicking
-            distance          = 1.0
+            hand_visible    = False
+            is_pinching_now = self._was_pinching
+            is_right_now    = self._was_right_clicking
+            is_middle_now   = self._was_middle_clicking
+            distance        = 1.0
 
             if results.hand_landmarks:
                 hand_visible = True
@@ -489,16 +489,20 @@ class HandTracker(threading.Thread):
                 ring_distance   = _dist(ring_tip,   thumb_tip)
                 pinky_distance  = _dist(pinky_tip,  thumb_tip)
 
-                # Punto de control: centro entre índice y pulgar.
+                # Cursor position: midpoint between index and thumb.
+                # When pinching, both fingers move symmetrically toward the center
+                # so the midpoint barely shifts — no position jump on click.
                 src_x = (index_tip.x + thumb_tip.x) / 2
                 src_y = (index_tip.y + thumb_tip.y) / 2
 
+                # Map camera coords to screen with edge margin to reach corners.
                 m = EDGE_MARGIN
                 nx = (src_x - m) / (1 - 2 * m)
                 ny = (src_y - m) / (1 - 2 * m)
                 target_x = max(0, min(SCREEN_W - 1, nx * SCREEN_W))
                 target_y = max(0, min(SCREEN_H - 1, ny * SCREEN_H))
 
+                # Exponential smoothing + dead zone to suppress micro-jitter.
                 ddx = target_x - self._smooth_x
                 ddy = target_y - self._smooth_y
                 dist_px = math.hypot(ddx, ddy)
@@ -507,19 +511,19 @@ class HandTracker(threading.Thread):
                     self._smooth_x += ddx * move_frac
                     self._smooth_y += ddy * move_frac
 
-                # Histeresis izquierdo (índice)
+                # Hysteresis for left click (index finger)
                 if distance < PINCH_ON_THRESHOLD:
                     is_pinching_now = True
                 elif distance > PINCH_OFF_THRESHOLD:
                     is_pinching_now = False
 
-                # Histeresis medio (mayor) — middle click
+                # Hysteresis for middle click (middle finger)
                 if middle_distance < PINCH_ON_THRESHOLD:
                     is_middle_now = True
                 elif middle_distance > PINCH_OFF_THRESHOLD:
                     is_middle_now = False
 
-                # Histeresis anular — right click (hold)
+                # Hysteresis for right click hold (ring finger)
                 if ring_distance < PINCH_ON_THRESHOLD:
                     is_right_now = True
                 elif ring_distance > PINCH_OFF_THRESHOLD:
@@ -529,26 +533,26 @@ class HandTracker(threading.Thread):
                 if mouse_on:
                     mx, my = int(self._smooth_x), int(self._smooth_y)
 
-                    # Meñique: right click instantáneo (dispara al tocar, no hace falta mantener)
+                    # Pinky: instant right click — fires on contact, no hold needed
                     pinky_near = pinky_distance < PINCH_ON_THRESHOLD
                     if pinky_near and not self._was_pinky_near:
                         _mouse_right_down(mx, my)
                         _mouse_right_up(mx, my)
                     self._was_pinky_near = pinky_near
 
-                    # Anular: right click sostenido
+                    # Ring: sustained right click (for context menus)
                     if is_right_now and not self._was_right_clicking:
                         _mouse_right_down(mx, my)
                     elif (not is_right_now) and self._was_right_clicking:
                         _mouse_right_up(mx, my)
 
-                    # Medio/mayor: middle click
+                    # Middle finger: middle click
                     elif is_middle_now and not self._was_middle_clicking:
                         _mouse_middle_down(mx, my)
                     elif (not is_middle_now) and self._was_middle_clicking:
                         _mouse_middle_up(mx, my)
 
-                    # Índice: left click / drag / doble click
+                    # Index: left click / drag / double click
                     elif is_pinching_now and not self._was_pinching:
                         now = time.time()
                         self._click_count = (2 if now - self._last_pinch_end < DOUBLE_CLICK_INTERVAL
@@ -588,7 +592,7 @@ class HandTracker(threading.Thread):
                     cv2.circle(frame, (ix, iy), 9, color, -1)
                     cv2.circle(frame, (tx, ty), 9, color, -1)
             else:
-                # Mano fuera de cuadro: soltar todos los botones activos.
+                # Hand out of frame: release any active buttons.
                 mx, my = int(self._smooth_x), int(self._smooth_y)
                 if self._was_pinching:
                     _mouse_up(mx, my, self._click_count)
@@ -604,17 +608,17 @@ class HandTracker(threading.Thread):
                 state.update(hand_visible=False, is_pinching=False,
                              is_right_clicking=False, is_middle_clicking=False)
 
-            # Overlay de debug (texto).
+            # Debug text overlay
             if self.debug:
                 _, _, _, _, mouse_on = state.snapshot()
                 if is_right_now:
-                    status, status_color = "CLICK DERECHO", (180, 60, 255)
+                    status, status_color = "RIGHT CLICK", (180, 60, 255)
                 elif is_middle_now:
-                    status, status_color = "CLICK MEDIO", (60, 220, 140)
+                    status, status_color = "MIDDLE CLICK", (60, 220, 140)
                 elif is_pinching_now:
                     status, status_color = "CLICK / DRAG", (60, 60, 255)
                 else:
-                    status, status_color = "MOVER", (60, 220, 60)
+                    status, status_color = "MOVE", (60, 220, 60)
                 cv2.putText(frame, status, (12, 38),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.1, status_color, 2)
                 cv2.putText(frame, f"dist: {distance:.3f}", (12, 70),
@@ -633,7 +637,7 @@ class HandTracker(threading.Thread):
                             (w - 110, 28), cv2.FONT_HERSHEY_SIMPLEX,
                             0.6, (200, 200, 200), 1)
                 cv2.putText(frame,
-                            "ESC salir | D debug | M mouse on/off",
+                            "ESC quit | D debug | M mouse on/off",
                             (12, h - 16), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, (200, 200, 200), 1)
 
@@ -644,21 +648,21 @@ class HandTracker(threading.Thread):
 
 
 def main():
-    # Abre la cámara brevemente en el hilo principal para disparar el
-    # diálogo de permisos de macOS (no se puede hacer desde un hilo secundario).
+    # Open the camera briefly on the main thread to trigger the macOS
+    # permission dialog — it cannot be requested from a background thread.
     _cap = cv2.VideoCapture(CAMERA_INDEX)
     if _cap.isOpened():
         _cap.release()
     else:
-        print("Esperando permisos de camara... Acepta el dialogo de macOS.")
+        print("Waiting for camera permission... Accept the macOS dialog.")
         time.sleep(2)
         _cap.release()
-    # Con el permiso ya otorgado, el hilo de tracking puede abrir la camara
-    # sin necesitar girar el run-loop principal.
+    # With permission granted, the tracking thread can open the camera
+    # without needing to spin the main run loop.
     os.environ["OPENCV_AVFOUNDATION_SKIP_AUTH"] = "1"
 
     app = QApplication(sys.argv)
-    _macos_background_app()  # sin ícono en Dock, ventanas no se ocultan al cambiar app
+    _macos_background_app()  # no Dock icon; windows stay visible when switching apps
 
     tracker = HandTracker(debug=True)
 
@@ -670,7 +674,7 @@ def main():
 
     tray = TrayIcon(tracker, parent=None)
 
-    # Cmd+Q global
+    # Global Cmd+Q shortcut
     from PyQt5.QtWidgets import QShortcut
     quit_sc = QShortcut(QKeySequence("Ctrl+Q"), debug_overlay)
     quit_sc.setContext(Qt.ApplicationShortcut)
