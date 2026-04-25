@@ -32,8 +32,8 @@ from PyQt5.QtGui import QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, Q
 from PyQt5.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
 
 # ----- General settings -----
-PINCH_ON_THRESHOLD    = 0.055  # normalized distance to trigger a pinch
-PINCH_OFF_THRESHOLD   = 0.085  # hysteresis: distance to release (prevents flickering)
+PINCH_ON_THRESHOLD    = 0.07   # normalized distance to trigger a pinch
+PINCH_OFF_THRESHOLD   = 0.10   # hysteresis: distance to release (prevents flickering)
 SMOOTHING             = 0.15   # 0 = no smoothing, 1 = no movement
 DEADZONE_PX           = 5      # movements smaller than N screen px are ignored (anti-jitter)
 EDGE_MARGIN           = 0.12   # camera edge crop to make corners reachable
